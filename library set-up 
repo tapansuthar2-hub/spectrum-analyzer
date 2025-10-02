@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""
+Spectrum Analyzer Dependencies Installer
+Automatically installs all required libraries for the spectrum analyzer project.
+"""
+
+import subprocess
+import sys
+import os
+import platform
+
+def print_banner():
+    """Print installation banner."""
+    print("=" * 60)
+    print("    SPECTRUM ANALYZER - DEPENDENCY INSTALLER")
+    print("=" * 60)
+    print("This script will install all required Python libraries")
+    print("for the Interactive Spectrum Analyzer project.")
+    print("=" * 60)
+
+def check_python_version():
+    """Check if Python version is compatible."""
+    version = sys.version_info
+    print(f"🐍 Python version: {version.major}.{version.minor}.{version.micro}")
+    
+    if version.major < 3 or (version.major == 3 and version.minor < 7):
+        print("❌ Error: Python 3.7 or higher is required!")
+        print("Please update your Python installation.")
+        return False
+    else:
+        print("✅ Python version is compatible!")
+        return True
+
+def check_pip():
+    """Check if pip is available and upgrade it."""
+    try:
+        import pip
+        print("✅ pip is available")
+        
+        # Upgrade pip
+        print("🔄 Upgrading pip to latest version...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
+        print("✅ pip upgraded successfully!")
+        return True
+        
+    except ImportError:
+        print("❌ pip is not installed!")
+        print("Please install pip first: https://pip.pypa.io/en/stable/installation/")
+        return False
+    except Exception as e:
+        print(f"⚠️  Warning: Could not upgrade pip: {e}")
+        return True
+
+def install_package(package_name, import_name=None):
+    """Install a single package with error handling."""
+    if import_name is None:
+        import_name = package_name
+    
+    print(f"📦 Installing {package_name}...")
+    
+    try:
+        # First, try to import to see if it's already installed
+        __import__(import_name)
+        print(f"✅ {package_name} is already installed!")
+        return True
+        
+    except ImportError:
+        # Package not installed, install it
+        try:
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", package_name, "--user"
+            ])
+            print(f"✅ {package_name} installed successfully!")
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Failed to install {package_name}: {e}")
+            return False
+        except Exception as e:
+            print(f"❌ Unexpected error installing {package_name}: {e}")
+            return False
+
+def install_opencv():
+    """Install OpenCV with proper package name."""
+    print("📦 Installing OpenCV...")
+    
+    try:
+        import cv2
+        print("✅ OpenCV is already installed!")
+        return True
+    except ImportError:
+        pass
+    
+    # Try different OpenCV package names
+    opencv_packages = [
+        "opencv-python",
+        "opencv-contrib-python",
+        "opencv-python-headless"
+    ]
+    
+    for package in opencv_packages:
+        try:
+            print(f"🔄 Trying to install {package}...")
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", package, "--user"
+            ])
+            
+            # Test if installation worked
+            import cv2
+            print(f"✅ OpenCV installed successfully via {package}!")
+            return True
+            
+        except (subprocess.CalledProcessError, ImportError):
+            print(f"❌ {package} installation failed, trying next option...")
+            continue
+        except Exception as e:
+            print(f"❌ Unexpected error with {package}: {e}")
+            continue
+    
+    print("❌ Failed to install OpenCV with all attempted packages!")
+    return False
+
+def create_requirements_file():
+    """Create a requirements.txt file for future reference."""
+    requirements = [
+        "numpy>=1.19.0",
+        "pandas>=1.2.0", 
+        "matplotlib>=3.3.0",
+        "scipy>=1.6.0",
+        "opencv-python>=4.5.0"
+    ]
+    
+    try:
+        with open("requirements.txt", "w") as f:
+            for req in requirements:
+                f.write(req + "\n")
+        print("✅ Created requirements.txt file for future reference!")
+        return True
+    except Exception as e:
+        print(f"⚠️  Warning: Could not create requirements.txt: {e}")
+        return False
+
+def test_imports():
+    """Test if all required packages can be imported."""
+    print("\n🧪 Testing all imports...")
+    
+    test_packages = {
+        "cv2": "OpenCV",
+        "numpy": "NumPy", 
+        "pandas": "Pandas",
+        "matplotlib.pyplot": "Matplotlib",
+        "scipy.signal": "SciPy",
+        "json": "JSON (built-in)",
+        "os": "OS (built-in)",
+        "itertools": "itertools (built-in)",
+        "datetime": "datetime (built-in)"
+    }
+    
+    failed_imports = []
+    
+    for module, name in test_packages.items():
+        try:
+            __import__(module)
+            print(f"✅ {name}: OK")
+        except ImportError as e:
+            print(f"❌ {name}: FAILED - {e}")
+            failed_imports.append(name)
+        except Exception as e:
+            print(f"⚠️  {name}: WARNING - {e}")
+    
+    if failed_imports:
+        print(f"\n❌ Failed imports: {', '.join(failed_imports)}")
+        return False
+    else:
+        print(f"\n🎉 All packages imported successfully!")
+        return True
+
+def get_system_info():
+    """Display system information."""
+    print("\n💻 System Information:")
+    print(f"   OS: {platform.system()} {platform.release()}")
+    print(f"   Architecture: {platform.machine()}")
+    print(f"   Python: {sys.version}")
+    print(f"   Python executable: {sys.executable}")
+
+def main():
+    """Main installation process."""
+    print_banner()
+    get_system_info()
+    
+    # Check Python version
+    if not check_python_version():
+        sys.exit(1)
+    
+    # Check pip
+    if not check_pip():
+        sys.exit(1)
+    
+    print("\n🚀 Starting package installation...")
+    
+    # List of packages to install
+    packages_to_install = [
+        ("numpy", "numpy"),
+        ("pandas", "pandas"), 
+        ("matplotlib", "matplotlib"),
+        ("scipy", "scipy")
+    ]
+    
+    # Install standard packages
+    failed_packages = []
+    
+    for package, import_name in packages_to_install:
+        if not install_package(package, import_name):
+            failed_packages.append(package)
+    
+    # Install OpenCV separately (needs special handling)
+    if not install_opencv():
+        failed_packages.append("opencv-python")
+    
+    # Create requirements file
+    create_requirements_file()
+    
+    # Test all imports
+    print("\n" + "=" * 50)
+    if test_imports():
+        print("\n🎉 SUCCESS! All dependencies installed correctly!")
+        print("\nYou can now run the spectrum analyzer with:")
+        print("python spectrum_analyzer.py")
+        
+        if failed_packages:
+            print(f"\n⚠️  Note: Some packages had installation issues: {', '.join(failed_packages)}")
+            print("But the main functionality should still work.")
+            
+    else:
+        print("\n❌ INSTALLATION INCOMPLETE!")
+        print("Some packages failed to install or import.")
+        print("\nYou can try installing failed packages manually:")
+        for pkg in failed_packages:
+            print(f"pip install {pkg}")
+    
+    print("\n" + "=" * 50)
+    print("Installation process completed!")
+    print("Check the messages above for any issues.")
+    
+    # Pause so user can see results
+    input("\nPress Enter to exit...")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n❌ Installation cancelled by user.")
+    except Exception as e:
+        print(f"\n❌ Unexpected error during installation: {e}")
+        print("Please try running the script again or install packages manually.")
