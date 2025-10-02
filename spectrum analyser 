@@ -1,0 +1,594 @@
+import cv2
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
+import json
+import os
+from itertools import combinations
+from matplotlib.backends.backend_pdf import PdfPages
+import datetime
+
+# ===============================
+# Reference Spectral Lines Database
+# ===============================
+SPECTRAL_DATABASE = {
+    "Hydrogen": [410.2, 434.0, 486.1, 656.3],
+    "Helium": [447.1, 468.6, 492.2, 501.6, 587.6, 667.8],
+    "Sodium": [589.0, 589.6],
+    "Magnesium": [518.3, 517.3, 383.8],
+    "Calcium": [422.7, 393.4],
+    "Mercury": [404.7, 435.8, 546.1, 577.0],
+    "Neon": [540.1, 585.2, 640.2, 703.2],
+    "Argon": [696.5, 706.7, 738.4, 763.5, 794.8, 800.6, 811.5],
+}
+
+# Global variables to store calibration and error correction data
+CALIBRATION_COEFS = None
+ERROR_CORRECTION_SPECTRUM = None
+ANALYSIS_COUNT = 0
+
+# ===============================
+# Utility Functions
+# ===============================
+def ensure_dir(directory):
+    """Create directory if it doesn't exist."""
+    if directory and not os.path.exists(directory):
+        os.makedirs(directory)
+
+def get_user_input(prompt, input_type="string", options=None):
+    """Get user input with validation."""
+    while True:
+        try:
+            user_input = input(prompt).strip()
+            
+            if input_type == "string":
+                if user_input:
+                    return user_input
+                else:
+                    print("Please enter a valid input.")
+                    continue
+                    
+            elif input_type == "yn":
+                if user_input.lower() in ['y', 'yes']:
+                    return True
+                elif user_input.lower() in ['n', 'no']:
+                    return False
+                else:
+                    print("Please enter 'y' for yes or 'n' for no.")
+                    continue
+                    
+            elif input_type == "path":
+                if os.path.exists(user_input):
+                    return user_input
+                else:
+                    print(f"File not found: {user_input}")
+                    print("Please check the path and try again.")
+                    continue
+                    
+        except KeyboardInterrupt:
+            print("\nOperation cancelled by user.")
+            return None
+
+# ===============================
+# Spectrum Extraction
+# ===============================
+def load_spectrum_image(img_path):
+    """Load grayscale spectrum image."""
+    img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise FileNotFoundError(f"Image not found: {img_path}")
+    return img
+
+def extract_1d_spectrum(img_gray):
+    """Collapse spectrum image to 1D intensity profile."""
+    return np.sum(img_gray, axis=0)
+
+# ===============================
+# Error Correction
+# ===============================
+def load_error_correction(error_img_path):
+    """Load and process error correction spectrum (background/dark current)."""
+    print(f"Loading error correction spectrum from: {error_img_path}")
+    img_gray = load_spectrum_image(error_img_path)
+    error_spectrum = extract_1d_spectrum(img_gray)
+    print("Error correction spectrum loaded successfully.")
+    return error_spectrum
+
+def apply_error_correction(spectrum, error_spectrum):
+    """Apply error correction by subtracting background spectrum."""
+    if error_spectrum is None:
+        return spectrum
+    
+    # Ensure both spectra have the same length
+    min_len = min(len(spectrum), len(error_spectrum))
+    corrected = spectrum[:min_len] - error_spectrum[:min_len]
+    
+    # Avoid negative values
+    corrected = np.maximum(corrected, 0)
+    print("Error correction applied.")
+    return corrected
+
+# ===============================
+# Calibration
+# ===============================
+def calibrate_with_lamp(img_path, reference_lines, degree=2):
+    """Calibrate pixel->wavelength using a known lamp spectrum."""
+    print(f"Calibrating with reference lamp: {img_path}")
+    img_gray = load_spectrum_image(img_path)
+    intensity = extract_1d_spectrum(img_gray)
+    
+    # Apply error correction if available
+    if ERROR_CORRECTION_SPECTRUM is not None:
+        intensity = apply_error_correction(intensity, ERROR_CORRECTION_SPECTRUM)
+    
+    # Find peaks
+    peaks, _ = find_peaks(intensity, height=np.max(intensity)*0.2, distance=10)
+    
+    if len(peaks) == 0:
+        print("Warning: No peaks found in calibration spectrum!")
+        return None
+    
+    print(f"Found {len(peaks)} peaks in calibration spectrum.")
+    
+    # Match peaks with known reference lines
+    matches_px, matches_wl = [], []
+    for ref in reference_lines:
+        px_guess = (ref - 400) / (700 - 400) * len(intensity)  # rough guess
+        if len(peaks) > 0:
+            nearest_idx = np.argmin(np.abs(peaks - px_guess))
+            nearest = peaks[nearest_idx]
+            matches_px.append(nearest)
+            matches_wl.append(ref)
+    
+    if len(matches_px) < 2:
+        print("Warning: Not enough peak matches for calibration!")
+        return None
+    
+    # Fit polynomial mapping
+    coefs = np.polyfit(matches_px, matches_wl, min(degree, len(matches_px)-1))
+    print(f"Calibration successful! Coefficients: {coefs}")
+    
+    return coefs
+
+def apply_calibration(intensity, coefs):
+    """Apply pixel->wavelength mapping."""
+    pixels = np.arange(len(intensity))
+    wavelength = np.polyval(coefs, pixels)
+    return wavelength
+
+# ===============================
+# Peak Detection & Matching
+# ===============================
+def detect_peaks(intensity, wavelengths, threshold=0.2):
+    """Find spectral peaks and return (wavelength, intensity)."""
+    peaks, props = find_peaks(intensity, height=np.max(intensity)*threshold, distance=5)
+    if len(peaks) == 0:
+        return np.array([]), np.array([])
+    peak_wl = wavelengths[peaks]
+    peak_int = intensity[peaks]
+    return peak_wl, peak_int
+
+def match_elements(peak_wavelengths, tolerance=2.0):
+    """Match detected peaks to known spectral lines."""
+    results = {}
+    for element, lines in SPECTRAL_DATABASE.items():
+        matches = []
+        for line in lines:
+            if len(peak_wavelengths) > 0 and np.any(np.abs(peak_wavelengths - line) <= tolerance):
+                matches.append(line)
+        if matches:
+            results[element] = {
+                'matched_lines': matches,
+                'num_matches': len(matches),
+                'score': len(matches) / len(lines)
+            }
+    return results
+
+def score_match(peaks, reference_lines, tolerance=2.0):
+    """Compute a score for how well detected peaks match reference lines."""
+    if len(peaks) == 0:
+        return 0.0, []
+    
+    matched = []
+    for r in reference_lines:
+        if any(abs(p - r) < tolerance for p in peaks):
+            matched.append(r)
+    
+    # Score = matched / (total reference lines + penalty for unmatched)
+    if len(reference_lines) == 0:
+        return 0.0, matched
+    
+    score = len(matched) / (len(reference_lines) + 0.5 * (len(reference_lines) - len(matched)))
+    return score, matched
+
+def match_combinations(peaks, max_elements=3, tolerance=2.0):
+    """Try combinations of known elements and return best matches."""
+    if len(peaks) == 0:
+        return []
+    
+    results = []
+    element_names = list(SPECTRAL_DATABASE.keys())
+    
+    for r in range(2, max_elements + 1):
+        for combo in combinations(element_names, r):
+            combined_lines = []
+            for elem in combo:
+                combined_lines.extend(SPECTRAL_DATABASE[elem])
+            
+            score, matched = score_match(peaks, combined_lines, tolerance=tolerance)
+            
+            if score > 0:
+                results.append({
+                    "elements": combo,
+                    "matched_peaks": matched,
+                    "score": score
+                })
+    
+    # Sort best to worst
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:10]
+
+# ===============================
+# PDF Report Generation
+# ===============================
+def generate_pdf_report(img_path, wavelengths, intensity, peaks_wl, peaks_int, 
+                       single_matches, combos, out_pdf_path):
+    """Generate a comprehensive PDF report."""
+    
+    # Convert to safe types
+    wavelengths = [float(x) for x in wavelengths]
+    intensity = [float(x) for x in intensity]
+    peaks_wl = [float(x) for x in (peaks_wl if len(peaks_wl) > 0 else [])]
+    peaks_int = [float(x) for x in (peaks_int if len(peaks_int) > 0 else [])]
+
+    ensure_dir(os.path.dirname(out_pdf_path) or ".")
+    date_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with PdfPages(out_pdf_path) as pdf:
+        # Page 1: Title and Summary
+        fig = plt.figure(figsize=(8.27, 11.69))
+        plt.axis('off')
+        plt.text(0.5, 0.92, "Spectrum Analysis Report", ha="center", va="center", 
+                fontsize=20, weight='bold')
+        plt.text(0.5, 0.88, os.path.basename(img_path), ha="center", va="center", 
+                fontsize=12)
+        plt.text(0.02, 0.80, f"Generated: {date_str}", fontsize=9)
+
+        # Single element matches
+        plt.text(0.02, 0.72, "Single-element matches:", fontsize=11, weight='bold')
+        y = 0.70
+        if single_matches:
+            for element, info in single_matches.items():
+                score = info.get('score', 0)
+                num_matches = info.get('num_matches', 0)
+                plt.text(0.04, y, f"- {element}: {num_matches} matches, score: {score:.3f}", 
+                        fontsize=10)
+                y -= 0.03
+        else:
+            plt.text(0.04, y, "No single-element matches found.", fontsize=10)
+
+        # Top combinations
+        plt.text(0.02, 0.40, "Top element combinations:", fontsize=11, weight='bold')
+        y = 0.38
+        if combos:
+            for i, c in enumerate(combos[:10], start=1):
+                elems = ", ".join(c.get("elements", []))
+                score = c.get("score", 0.0)
+                num_matched = len(c.get("matched_peaks", []))
+                plt.text(0.04, y, f"{i}. {elems} — matches: {num_matched}, score: {score:.3f}", 
+                        fontsize=9)
+                y -= 0.03
+        else:
+            plt.text(0.04, y, "No combination matches found.", fontsize=10)
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # Page 2: Spectrum Plot
+        fig, ax = plt.subplots(figsize=(11, 6))
+        ax.plot(wavelengths, intensity, linewidth=0.9, label='Spectrum')
+        if len(peaks_wl) > 0:
+            ax.scatter(peaks_wl, peaks_int, color='red', marker='x', s=50, 
+                      zorder=3, label='Detected Peaks')
+            # Label peaks
+            for x, yv in zip(peaks_wl, peaks_int):
+                ax.text(x, yv + max(intensity)*0.03, f"{x:.1f}", 
+                       ha='center', va='bottom', fontsize=8, rotation=45)
+        
+        ax.set_xlabel("Wavelength (nm)")
+        ax.set_ylabel("Intensity (a.u.)")
+        ax.set_title("Spectrum Analysis with Detected Peaks")
+        ax.legend()
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # Page 3: Peak Table
+        fig = plt.figure(figsize=(8.27, 11.69))
+        plt.axis('off')
+        plt.text(0.5, 0.95, "Detected Peaks", ha="center", va="center", 
+                fontsize=14, weight='bold')
+        
+        if len(peaks_wl) > 0:
+            col_labels = ["Peak #", "Wavelength (nm)", "Intensity"]
+            rows = []
+            for i, (wl, inten) in enumerate(zip(peaks_wl, peaks_int), start=1):
+                rows.append([str(i), f"{wl:.2f}", f"{inten:.0f}"])
+            
+            table = plt.table(cellText=rows, colLabels=col_labels, 
+                             cellLoc='center', loc='center')
+            table.auto_set_font_size(False)
+            table.set_fontsize(10)
+            table.scale(1, 1.5)
+        else:
+            plt.text(0.5, 0.5, "No peaks detected.", ha="center", va="center", 
+                    fontsize=12)
+        
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    print(f"PDF report saved: {out_pdf_path}")
+    return out_pdf_path
+
+# ===============================
+# Main Analysis Function
+# ===============================
+def analyze_spectrum(img_path, save_csv=True, generate_pdf=True):
+    """Process spectrum image with calibration and element matching."""
+    global CALIBRATION_COEFS, ERROR_CORRECTION_SPECTRUM
+    
+    if CALIBRATION_COEFS is None:
+        print("Error: No calibration data available. Please run calibration first.")
+        return None
+    
+    print(f"\nAnalyzing spectrum: {os.path.basename(img_path)}")
+    
+    # Load spectrum
+    img_gray = load_spectrum_image(img_path)
+    intensity = extract_1d_spectrum(img_gray)
+    
+    # Apply error correction if available
+    if ERROR_CORRECTION_SPECTRUM is not None:
+        intensity = apply_error_correction(intensity, ERROR_CORRECTION_SPECTRUM)
+    
+    # Apply calibration
+    wavelengths = apply_calibration(intensity, CALIBRATION_COEFS)
+    
+    # Detect peaks
+    peak_wl, peak_int = detect_peaks(intensity, wavelengths)
+    
+    print(f"Detected {len(peak_wl)} peaks.")
+    
+    # Match to elements
+    single_matches = match_elements(peak_wl)
+    combos = match_combinations(peak_wl)
+    
+    # Create output directory
+    base_name = os.path.splitext(os.path.basename(img_path))[0]
+    output_dir = "results"
+    ensure_dir(output_dir)
+    
+    # Save CSV
+    if save_csv:
+        csv_path = os.path.join(output_dir, f"{base_name}_spectrum.csv")
+        df = pd.DataFrame({"Wavelength_nm": wavelengths, "Intensity": intensity})
+        df.to_csv(csv_path, index=False)
+        print(f"Spectrum data saved: {csv_path}")
+    
+    # Generate PDF report
+    if generate_pdf:
+        pdf_path = os.path.join(output_dir, f"{base_name}_report.pdf")
+        generate_pdf_report(img_path, wavelengths, intensity, peak_wl, peak_int,
+                           single_matches, combos, pdf_path)
+    
+    # Display results
+    print("\n" + "="*50)
+    print("ANALYSIS RESULTS")
+    print("="*50)
+    
+    if single_matches:
+        print("\nSingle Element Matches:")
+        for element, info in single_matches.items():
+            score = info['score']
+            num_matches = info['num_matches']
+            matched_lines = info['matched_lines']
+            print(f"  {element}: {num_matches} matches (score: {score:.3f})")
+            print(f"    Matched lines: {matched_lines}")
+    else:
+        print("\nNo single element matches found.")
+    
+    if combos:
+        print(f"\nTop Element Combinations:")
+        for i, combo in enumerate(combos[:5], 1):
+            elements = ", ".join(combo['elements'])
+            score = combo['score']
+            num_matched = len(combo['matched_peaks'])
+            print(f"  {i}. {elements}")
+            print(f"     Score: {score:.3f}, Matched peaks: {num_matched}")
+    else:
+        print("\nNo combination matches found.")
+    
+    # Show plot
+    plt.figure(figsize=(12, 6))
+    plt.plot(wavelengths, intensity, label="Spectrum", linewidth=1)
+    if len(peak_wl) > 0:
+        plt.scatter(peak_wl, peak_int, color="red", label="Detected Peaks", 
+                   zorder=5, s=50)
+        # Label peaks with wavelength
+        for x, y in zip(peak_wl, peak_int):
+            plt.annotate(f'{x:.1f}', (x, y), xytext=(0, 10), 
+                        textcoords='offset points', ha='center', 
+                        fontsize=8, rotation=45)
+    
+    plt.xlabel("Wavelength (nm)")
+    plt.ylabel("Intensity")
+    plt.title(f"Spectrum Analysis: {os.path.basename(img_path)}")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+    
+    return {
+        'wavelengths': wavelengths,
+        'intensity': intensity,
+        'peaks_wl': peak_wl,
+        'peaks_int': peak_int,
+        'single_matches': single_matches,
+        'combos': combos
+    }
+
+# ===============================
+# Interactive Setup Functions
+# ===============================
+def setup_error_correction():
+    """Setup error correction spectrum."""
+    global ERROR_CORRECTION_SPECTRUM
+    
+    print("\n" + "="*50)
+    print("ERROR CORRECTION SETUP")
+    print("="*50)
+    print("Error correction removes background noise and dark current.")
+    print("You need an image of your spectroscope with no sample (background only).")
+    
+    use_error_correction = get_user_input(
+        "Do you want to use error correction? (y/n): ", "yn")
+    
+    if use_error_correction:
+        error_img_path = get_user_input(
+            "Enter path to background/error correction image: ", "path")
+        
+        if error_img_path:
+            try:
+                ERROR_CORRECTION_SPECTRUM = load_error_correction(error_img_path)
+                print("✓ Error correction setup complete!")
+                return True
+            except Exception as e:
+                print(f"Error loading correction image: {e}")
+                ERROR_CORRECTION_SPECTRUM = None
+                return False
+    else:
+        print("Skipping error correction.")
+        ERROR_CORRECTION_SPECTRUM = None
+        return True
+
+def setup_calibration():
+    """Setup wavelength calibration."""
+    global CALIBRATION_COEFS
+    
+    print("\n" + "="*50)
+    print("CALIBRATION SETUP")
+    print("="*50)
+    print("Available calibration sources:")
+    for i, (element, lines) in enumerate(SPECTRAL_DATABASE.items(), 1):
+        print(f"  {i}. {element}: {lines}")
+    
+    # Get calibration lamp choice
+    while True:
+        choice = input("\nEnter calibration element name (e.g., 'Mercury'): ").strip()
+        if choice in SPECTRAL_DATABASE:
+            reference_lines = SPECTRAL_DATABASE[choice]
+            print(f"Selected {choice} with lines: {reference_lines}")
+            break
+        else:
+            print("Invalid choice. Please enter a valid element name.")
+    
+    # Get calibration image path
+    cal_img_path = get_user_input(
+        f"Enter path to {choice} calibration lamp image: ", "path")
+    
+    if cal_img_path:
+        try:
+            CALIBRATION_COEFS = calibrate_with_lamp(cal_img_path, reference_lines)
+            if CALIBRATION_COEFS is not None:
+                print("✓ Calibration setup complete!")
+                return True
+            else:
+                print("✗ Calibration failed!")
+                return False
+        except Exception as e:
+            print(f"Error during calibration: {e}")
+            return False
+    
+    return False
+
+# ===============================
+# Main Interactive Interface
+# ===============================
+def main_interface():
+    """Main interactive interface for spectrum analysis."""
+    global ANALYSIS_COUNT
+    
+    print("="*60)
+    print("    INTERACTIVE SPECTRUM ANALYZER")
+    print("="*60)
+    print("Welcome to the Enhanced Spectrum Analyzer!")
+    print("This tool will guide you through the analysis process.")
+    
+    # First-time setup
+    if ANALYSIS_COUNT == 0:
+        print("\n🔧 INITIAL SETUP")
+        
+        # Setup error correction
+        if not setup_error_correction():
+            print("Warning: Continuing without error correction.")
+        
+        # Setup calibration
+        if not setup_calibration():
+            print("Error: Calibration is required. Exiting.")
+            return
+        
+        ANALYSIS_COUNT += 1
+    
+    # Analysis loop
+    while True:
+        print("\n" + "="*50)
+        print("SPECTRUM ANALYSIS")
+        print("="*50)
+        
+        # Get analysis image path
+        analysis_img_path = get_user_input(
+            "Enter path to spectrum image for analysis: ", "path")
+        
+        if analysis_img_path is None:
+            break
+        
+        try:
+            # Analyze spectrum
+            results = analyze_spectrum(analysis_img_path)
+            
+            if results is None:
+                print("Analysis failed!")
+                continue
+                
+            print(f"\n✓ Analysis complete! Check the 'results' folder for output files.")
+            
+        except Exception as e:
+            print(f"Error during analysis: {e}")
+            continue
+        
+        # Ask if user wants to analyze another image
+        print("\n" + "-"*50)
+        continue_analysis = get_user_input(
+            "Do you want to analyze another spectrum? (y/n): ", "yn")
+        
+        if not continue_analysis:
+            break
+        
+        ANALYSIS_COUNT += 1
+    
+    print("\nThank you for using the Interactive Spectrum Analyzer!")
+    print("All results have been saved in the 'results' folder.")
+
+# ===============================
+# Entry Point
+# ===============================
+if __name__ == "__main__":
+    try:
+        main_interface()
+    except KeyboardInterrupt:
+        print("\n\nProgram interrupted by user. Goodbye!")
+    except Exception as e:
+        print(f"\nUnexpected error: {e}")
+        print("Please check your inputs and try again.")
